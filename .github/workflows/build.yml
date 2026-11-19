@@ -50,11 +50,15 @@ jobs:
         run: |
           python3 - <<'PYEOF'
           import glob
+          import re
 
           ksu_src = ""
           for p in glob.glob("drivers/kernelsu/**/*.c", recursive=True) + glob.glob("drivers/kernelsu/**/*.h", recursive=True):
               with open(p, errors="ignore") as f:
                   ksu_src += f.read() + "\n"
+
+          found = sorted(set(re.findall(r"ksu_handle_[a-zA-Z0-9_]+", ksu_src)))
+          print("Found KSU hooks:", found)
 
           def patch_file(path, fn_sig, extern_code, anchor, hook_code):
               with open(path, "r") as f:
@@ -73,6 +77,19 @@ jobs:
               with open(path, "w") as f:
                   f.write(text)
               print(f"Patched: {path}")
+
+          if "ksu_handle_sys_reboot(" in ksu_src:
+              ext = (
+                  "#ifdef CONFIG_KSU\n"
+                  "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"
+                  "#endif\n"
+              )
+              hk = (
+                  "#ifdef CONFIG_KSU\n"
+                  "\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n"
+                  "#endif\n\t"
+              )
+              patch_file("kernel/reboot.c", "SYSCALL_DEFINE4(reboot,", ext, "if (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))", hk)
 
           if "ksu_handle_execveat(" in ksu_src:
               if "ksu_execveat_hook" in ksu_src and "ksu_handle_execveat_sucompat(" in ksu_src:
@@ -102,6 +119,18 @@ jobs:
                       "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
                       "#endif\n\t"
                   )
+              patch_file("fs/exec.c", "static int do_execveat_common(", ext, "if (IS_ERR(filename))", hk)
+          elif "ksu_handle_execve_sucompat(" in ksu_src:
+              ext = (
+                  "#ifdef CONFIG_KSU\n"
+                  "extern int ksu_handle_execve_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+                  "#endif\n"
+              )
+              hk = (
+                  "#ifdef CONFIG_KSU\n"
+                  "\tksu_handle_execve_sucompat(&fd, &filename, NULL, NULL, NULL);\n"
+                  "#endif\n\t"
+              )
               patch_file("fs/exec.c", "static int do_execveat_common(", ext, "if (IS_ERR(filename))", hk)
 
           if "ksu_handle_faccessat(" in ksu_src:
@@ -250,9 +279,11 @@ jobs:
           ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $ARGS $DEFCONFIG > /dev/null 2>&1
           grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config || true
-          make -k -j$(nproc) $ARGS > build.log 2>&1 || {
+          make -j$(nproc) $ARGS > build.log 2>&1 || {
             echo "=== ERRORS ==="
-            grep -n -E "error:|undefined reference|No such file|fatal error" build.log | head -40
+            grep -n -E "error:|ERROR:|undefined reference|No such file|fatal error|\*\*\*.*Stop|Error [0-9]" build.log | head -40 || true
+            echo "=== LAST 40 LINES ==="
+            tail -40 build.log
             exit 1
           }
           cat out/include/config/kernel.release
