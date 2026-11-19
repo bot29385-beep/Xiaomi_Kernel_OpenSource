@@ -1,0 +1,62 @@
+name: Build kernel
+on:
+  push:
+    branches: [merlin-r-oss]
+  workflow_dispatch:
+
+env:
+  DEFCONFIG: merlin_defconfig
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev cpio zip curl python3 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+
+      - name: Get clang
+        run: |
+          mkdir -p $HOME/tc/clang
+          curl -fL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz" | tar xz -C $HOME/tc/clang
+          echo "$HOME/tc/clang/bin" >> $GITHUB_PATH
+          $HOME/tc/clang/bin/clang --version
+          aarch64-linux-gnu-ld --version | head -1
+
+      - name: Add KernelSU-Next
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          cat >> arch/arm64/configs/$DEFCONFIG <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_KPROBE_HOOKS=y
+          EOF
+
+      - name: Build
+        run: |
+          mkdir out
+          ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make $ARGS $DEFCONFIG
+          make -j$(nproc) $ARGS 2>&1 | tee build.log
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-build
+          path: |
+            out/arch/arm64/boot/Image*
+            out/arch/arm64/boot/dts/mediatek/*.dtb
+            build.log
