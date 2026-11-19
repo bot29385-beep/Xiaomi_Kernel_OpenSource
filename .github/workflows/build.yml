@@ -31,18 +31,212 @@ jobs:
           curl -fL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz" | tar xz -C $HOME/tc/clang
           echo "$HOME/tc/clang/bin" >> $GITHUB_PATH
 
-      - name: Add KernelSU-Next
+      - name: Add KernelSU-Next (no kprobes)
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          sed -i '/CONFIG_KPROBES/d;/CONFIG_KPROBE_EVENTS/d;/CONFIG_KSU/d' arch/arm64/configs/$DEFCONFIG
           cat >> arch/arm64/configs/$DEFCONFIG <<'EOF'
           CONFIG_KSU=y
-          CONFIG_KPROBES=y
-          CONFIG_HAVE_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-          CONFIG_KSU_KPROBE_HOOKS=y
+          # CONFIG_KPROBES is not set
+          # CONFIG_KPROBE_EVENTS is not set
+          # CONFIG_KSU_KPROBE_HOOK is not set
+          # CONFIG_KSU_KPROBE_HOOKS is not set
+          CONFIG_KSU_MANUAL_HOOK=y
           CONFIG_LOCALVERSION="-g3851971ffd50"
           # CONFIG_LOCALVERSION_AUTO is not set
           EOF
+
+      - name: Patch manual hooks and path_umount
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+
+          ksu_src = ""
+          for p in glob.glob("drivers/kernelsu/**/*.c", recursive=True) + glob.glob("drivers/kernelsu/**/*.h", recursive=True):
+              with open(p, errors="ignore") as f:
+                  ksu_src += f.read() + "\n"
+
+          def patch_file(path, fn_sig, extern_code, anchor, hook_code):
+              with open(path, "r") as f:
+                  text = f.read()
+              if "CONFIG_KSU" in text:
+                  print(f"Skip (already patched): {path}")
+                  return
+              fn_pos = text.find(fn_sig)
+              if fn_pos == -1:
+                  raise RuntimeError(f"Function '{fn_sig}' not found in {path}")
+              anch_pos = text.find(anchor, fn_pos)
+              if anch_pos == -1:
+                  raise RuntimeError(f"Anchor '{anchor}' not found in {path}")
+              text = text[:anch_pos] + hook_code + text[anch_pos:]
+              text = text[:fn_pos] + extern_code + text[fn_pos:]
+              with open(path, "w") as f:
+                  f.write(text)
+              print(f"Patched: {path}")
+
+          if "ksu_handle_execveat(" in ksu_src:
+              if "ksu_execveat_hook" in ksu_src and "ksu_handle_execveat_sucompat(" in ksu_src:
+                  ext = (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern bool ksu_execveat_hook __read_mostly;\n"
+                      "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+                      "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+                      "#endif\n"
+                  )
+                  hk = (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tif (unlikely(ksu_execveat_hook))\n"
+                      "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                      "\telse\n"
+                      "\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n"
+                      "#endif\n\t"
+                  )
+              else:
+                  ext = (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+                      "#endif\n"
+                  )
+                  hk = (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n"
+                      "#endif\n\t"
+                  )
+              patch_file("fs/exec.c", "static int do_execveat_common(", ext, "if (IS_ERR(filename))", hk)
+
+          if "ksu_handle_faccessat(" in ksu_src:
+              ext = (
+                  "#ifdef CONFIG_KSU\n"
+                  "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n"
+                  "#endif\n"
+              )
+              hk = (
+                  "#ifdef CONFIG_KSU\n"
+                  "\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n"
+                  "#endif\n\t"
+              )
+              patch_file("fs/open.c", "SYSCALL_DEFINE3(faccessat,", ext, "if (mode & ~S_IRWXO)", hk)
+
+          if "ksu_handle_vfs_read(" in ksu_src:
+              if "ksu_vfs_read_hook" in ksu_src:
+                  ext = (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern bool ksu_vfs_read_hook __read_mostly;\n"
+                      "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n"
+                      "#endif\n"
+                  )
+                  hk = (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tif (unlikely(ksu_vfs_read_hook))\n"
+                      "\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
+                      "#endif\n\t"
+                  )
+              else:
+                  ext = (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n"
+                      "#endif\n"
+                  )
+                  hk = (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n"
+                      "#endif\n\t"
+                  )
+              patch_file("fs/read_write.c", "ssize_t vfs_read(", ext, "if (!(file->f_mode & FMODE_READ))", hk)
+
+          if "ksu_handle_stat(" in ksu_src:
+              ext = (
+                  "#ifdef CONFIG_KSU\n"
+                  "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+                  "#endif\n"
+              )
+              hk = (
+                  "#ifdef CONFIG_KSU\n"
+                  "\tksu_handle_stat(&dfd, &filename, &flags);\n"
+                  "#endif\n\t"
+              )
+              patch_file("fs/stat.c", "int vfs_statx(", ext, "if ((flags & ~(AT_SYMLINK_NOFOLLOW", hk)
+
+          if "ksu_handle_input_handle_event(" in ksu_src:
+              if "ksu_input_hook" in ksu_src:
+                  ext = (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern bool ksu_input_hook __read_mostly;\n"
+                      "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+                      "#endif\n"
+                  )
+                  hk = (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tif (unlikely(ksu_input_hook))\n"
+                      "\t\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                      "#endif\n\t"
+                  )
+              else:
+                  ext = (
+                      "#ifdef CONFIG_KSU\n"
+                      "extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);\n"
+                      "#endif\n"
+                  )
+                  hk = (
+                      "#ifdef CONFIG_KSU\n"
+                      "\tksu_handle_input_handle_event(&type, &code, &value);\n"
+                      "#endif\n\t"
+                  )
+              patch_file("drivers/input/input.c", "void input_event(", ext, "if (is_event_supported(type, dev->evbit, EV_MAX))", hk)
+
+          # Backport path_umount for Linux 4.14
+          with open("fs/namespace.c", "r") as f:
+              ns = f.read()
+          if "int path_umount(" not in ns:
+              umount_code = """static int can_umount(const struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+
+          	if (!may_mount())
+          		return -EPERM;
+          	if (path->dentry != path->mnt->mnt_root)
+          		return -EINVAL;
+          	if (!check_mnt(mnt))
+          		return -EINVAL;
+          	if (mnt->mnt.mnt_flags & MNT_LOCKED)
+          		return -EINVAL;
+          	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+          		return -EPERM;
+          	return 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+          	struct mount *mnt = real_mount(path->mnt);
+          	int ret;
+
+          	ret = can_umount(path, flags);
+          	if (!ret)
+          		ret = do_umount(mnt, flags);
+
+          	dput(path->dentry);
+          	mntput_no_expire(mnt);
+          	return ret;
+          }
+
+          """
+              pos = ns.find("SYSCALL_DEFINE2(umount,")
+              if pos == -1:
+                  raise RuntimeError("SYSCALL_DEFINE2(umount not found in fs/namespace.c")
+              ns = ns[:pos] + umount_code + ns[pos:]
+              with open("fs/namespace.c", "w") as f:
+                  f.write(ns)
+              print("Patched: fs/namespace.c (path_umount)")
+
+          with open("include/linux/fs.h", "r") as f:
+              fsh = f.read()
+          if "path_umount(" not in fsh:
+              pos = fsh.rfind("#endif")
+              fsh = fsh[:pos] + "\nextern int path_umount(struct path *path, int flags);\n" + fsh[pos:]
+              with open("include/linux/fs.h", "w") as f:
+                  f.write(fsh)
+              print("Patched: include/linux/fs.h (path_umount)")
+          PYEOF
 
       - name: Stub missing firmware include
         run: |
@@ -55,6 +249,7 @@ jobs:
           mkdir -p out
           ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $ARGS $DEFCONFIG > /dev/null 2>&1
+          grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config || true
           make -k -j$(nproc) $ARGS > build.log 2>&1 || {
             echo "=== ERRORS ==="
             grep -n -E "error:|undefined reference|No such file|fatal error" build.log | head -40
@@ -66,7 +261,7 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
           rm -rf ak3/.git ak3/.github ak3/README.md
-          cp out/arch/arm64/boot/Image.gz-dtb ak3/
+          cp out/arch/arm64/boot/Image.gz ak3/
           cat > ak3/anykernel.sh <<'EOF'
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
