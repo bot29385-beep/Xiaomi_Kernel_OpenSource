@@ -34,7 +34,7 @@ jobs:
       - name: Add KernelSU-Next (no kprobes)
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          sed -i '/CONFIG_KPROBES/d;/CONFIG_KPROBE_EVENTS/d;/CONFIG_KSU/d' arch/arm64/configs/$DEFCONFIG
+          sed -i '/CONFIG_KPROBES/d;/CONFIG_KPROBE_EVENTS/d;/CONFIG_KSU/d;/CONFIG_MTK_ENG_BUILD/d' arch/arm64/configs/$DEFCONFIG
           cat >> arch/arm64/configs/$DEFCONFIG <<'EOF'
           CONFIG_KSU=y
           # CONFIG_KPROBES is not set
@@ -42,6 +42,7 @@ jobs:
           # CONFIG_KSU_KPROBE_HOOK is not set
           # CONFIG_KSU_KPROBE_HOOKS is not set
           CONFIG_KSU_MANUAL_HOOK=y
+          # CONFIG_MTK_ENG_BUILD is not set
           CONFIG_LOCALVERSION="-g3851971ffd50"
           # CONFIG_LOCALVERSION_AUTO is not set
           EOF
@@ -265,6 +266,75 @@ jobs:
               with open("include/linux/fs.h", "w") as f:
                   f.write(fsh)
               print("Patched: include/linux/fs.h (path_umount)")
+          PYEOF
+
+      - name: Fix SSPM bootloop (sspm_reserve_memory_init)
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import re
+
+          def replace_bugs(body):
+              out = []
+              i = 0
+              n = len(body)
+              while i < n:
+                  if body.startswith("BUG_ON(", i):
+                      j = i + len("BUG_ON(")
+                      depth = 1
+                      while j < n and depth > 0:
+                          if body[j] == "(":
+                              depth += 1
+                          elif body[j] == ")":
+                              depth -= 1
+                          j += 1
+                      cond = body[i + len("BUG_ON("):j - 1]
+                      if j < n and body[j] == ";":
+                          j += 1
+                      out.append(f'{{ if ({cond}) {{ pr_err("[SSPM] reserve mem check failed, skip panic\\n"); return -1; }} }}')
+                      i = j
+                  elif body.startswith("BUG()", i):
+                      j = i + len("BUG()")
+                      if j < n and body[j] == ";":
+                          j += 1
+                      out.append('{ pr_err("[SSPM] reserve mem BUG skipped\\n"); return -1; }')
+                      i = j
+                  else:
+                      out.append(body[i])
+                      i += 1
+              return "".join(out)
+
+          patched = 0
+          for path in glob.glob("drivers/misc/mediatek/sspm/**/*.c", recursive=True):
+              with open(path, "r", errors="ignore") as f:
+                  text = f.read()
+              m = re.search(r"int\s+sspm_reserve_memory_init\s*\([^)]*\)\s*\{", text)
+              if not m:
+                  continue
+              start = m.end() - 1
+              depth = 0
+              end = start
+              while end < len(text):
+                  if text[end] == "{":
+                      depth += 1
+                  elif text[end] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end += 1
+                          break
+                  end += 1
+              orig_body = text[start:end]
+              new_body = replace_bugs(orig_body)
+              print(f"=== Found sspm_reserve_memory_init in {path} ===")
+              print(orig_body)
+              if new_body != orig_body:
+                  text = text[:start] + new_body + text[end:]
+                  with open(path, "w") as f:
+                      f.write(text)
+                  print(f"=== Patched {path} ===")
+                  patched += 1
+
+          print(f"Total SSPM files patched: {patched}")
           PYEOF
 
       - name: Stub missing firmware include
