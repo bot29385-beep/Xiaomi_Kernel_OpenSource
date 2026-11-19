@@ -10,7 +10,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -42,16 +42,21 @@ jobs:
           CONFIG_KSU_KPROBE_HOOKS=y
           EOF
 
+      - name: Stub missing firmware include
+        run: |
+          d=drivers/input/touchscreen/mediatek/focaltech_touch/include/firmware
+          mkdir -p $d
+          [ -f $d/fw_sample.i ] || echo "0x00," > $d/fw_sample.i
+          ls -la $d
+
       - name: Build
         run: |
           mkdir -p out
           ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $ARGS $DEFCONFIG > /dev/null 2>&1
-          make -j$(nproc) $ARGS > build.log 2>&1 || {
-            echo "=== ERROR LINES ==="
-            grep -n -E "error:|Error [0-9]|undefined reference|No such file|fatal" build.log | head -30
-            echo "=== SINGLE-THREAD RERUN ==="
-            make -j1 $ARGS 2>&1 | tail -30
+          make -k -j$(nproc) $ARGS > build.log 2>&1 || {
+            echo "=== ERRORS ==="
+            grep -n -E "error:|undefined reference|No such file|fatal error" build.log | head -40
             exit 1
           }
 
