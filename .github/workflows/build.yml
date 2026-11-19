@@ -30,8 +30,6 @@ jobs:
           mkdir -p $HOME/tc/clang
           curl -fL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz" | tar xz -C $HOME/tc/clang
           echo "$HOME/tc/clang/bin" >> $GITHUB_PATH
-          $HOME/tc/clang/bin/clang --version
-          aarch64-linux-gnu-ld --version | head -1
 
       - name: Add KernelSU-Next
         run: |
@@ -46,10 +44,16 @@ jobs:
 
       - name: Build
         run: |
-          mkdir out
+          mkdir -p out
           ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
-          make $ARGS $DEFCONFIG
-          make -j$(nproc) $ARGS 2>&1 | tee build.log
+          make $ARGS $DEFCONFIG > /dev/null 2>&1
+          make -j$(nproc) $ARGS > build.log 2>&1 || {
+            echo "=== ERROR LINES ==="
+            grep -n -E "error:|Error [0-9]|undefined reference|No such file|fatal" build.log | head -30
+            echo "=== SINGLE-THREAD RERUN ==="
+            make -j1 $ARGS 2>&1 | tail -30
+            exit 1
+          }
 
       - name: Upload result
         if: always()
