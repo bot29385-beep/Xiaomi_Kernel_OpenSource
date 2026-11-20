@@ -34,7 +34,7 @@ jobs:
       - name: Add KernelSU-Next (no kprobes)
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          sed -i '/CONFIG_KPROBES/d;/CONFIG_KPROBE_EVENTS/d;/CONFIG_KSU/d;/CONFIG_MTK_ENG_BUILD/d' arch/arm64/configs/$DEFCONFIG
+          sed -i '/CONFIG_KPROBES/d;/CONFIG_KPROBE_EVENTS/d;/CONFIG_KSU/d;/CONFIG_MTK_ENG_BUILD/d;/CONFIG_MODULE_FORCE_LOAD/d;/CONFIG_MODULE_SIG_FORCE/d' arch/arm64/configs/$DEFCONFIG
           cat >> arch/arm64/configs/$DEFCONFIG <<'EOF'
           CONFIG_KSU=y
           # CONFIG_KPROBES is not set
@@ -43,6 +43,8 @@ jobs:
           # CONFIG_KSU_KPROBE_HOOKS is not set
           CONFIG_KSU_MANUAL_HOOK=y
           # CONFIG_MTK_ENG_BUILD is not set
+          CONFIG_MODULE_FORCE_LOAD=y
+          # CONFIG_MODULE_SIG_FORCE is not set
           CONFIG_LOCALVERSION="-g3851971ffd50"
           # CONFIG_LOCALVERSION_AUTO is not set
           EOF
@@ -325,16 +327,45 @@ jobs:
                   end += 1
               orig_body = text[start:end]
               new_body = replace_bugs(orig_body)
-              print(f"=== Found sspm_reserve_memory_init in {path} ===")
-              print(orig_body)
               if new_body != orig_body:
                   text = text[:start] + new_body + text[end:]
                   with open(path, "w") as f:
                       f.write(text)
-                  print(f"=== Patched {path} ===")
+                  print(f"Patched SSPM: {path}")
                   patched += 1
 
           print(f"Total SSPM files patched: {patched}")
+          PYEOF
+
+      - name: Allow stock vendor modules (fix WiFi and Bluetooth)
+        run: |
+          python3 - <<'PYEOF'
+          import re
+
+          with open("kernel/module.c", "r") as f:
+              mc = f.read()
+
+          changed = False
+
+          target_magic = "return strcmp(amagic, bmagic) == 0;"
+          if target_magic in mc:
+              mc = mc.replace(target_magic, "return 1; /* allow stock vendor modules */", 1)
+              print("Patched: same_magic() in kernel/module.c")
+              changed = True
+          else:
+              print("WARNING: same_magic return not found")
+
+          m = re.search(r"(bad_version:\s*(?:pr_warn|printk)\([^;]+;\s*)return 0;", mc)
+          if m:
+              mc = mc[:m.start()] + m.group(1) + "return 1; /* allow stock vendor modules */" + mc[m.end():]
+              print("Patched: check_version() in kernel/module.c")
+              changed = True
+          else:
+              print("WARNING: bad_version block not found")
+
+          if changed:
+              with open("kernel/module.c", "w") as f:
+                  f.write(mc)
           PYEOF
 
       - name: Stub missing firmware include
@@ -348,7 +379,7 @@ jobs:
           mkdir -p out
           ARGS="O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make $ARGS $DEFCONFIG > /dev/null 2>&1
-          grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config || true
+          grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_MODULE|CONFIG_MODVERSIONS" out/.config || true
           make -j$(nproc) $ARGS > build.log 2>&1 || {
             echo "=== ERRORS ==="
             grep -n -E "error:|ERROR:|undefined reference|No such file|fatal error|\*\*\*.*Stop|Error [0-9]" build.log | head -40 || true
