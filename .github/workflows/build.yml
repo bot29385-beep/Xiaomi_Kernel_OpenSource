@@ -368,6 +368,79 @@ jobs:
                   f.write(mc)
           PYEOF
 
+      - name: Patch sel_write_access (hide DirtySepolicy)
+        run: |
+          python3 - <<'PYEOF'
+          import re
+
+          path = "security/selinux/selinuxfs.c"
+          with open(path, "r") as f:
+              text = f.read()
+
+          if "/* hide_dirty_sepolicy */" not in text:
+              if "#include <linux/cred.h>" not in text:
+                  inc_pos = text.find("#include <linux/security.h>")
+                  if inc_pos != -1:
+                      text = text[:inc_pos] + "#include <linux/cred.h>\n" + text[inc_pos:]
+                  else:
+                      text = "#include <linux/cred.h>\n" + text
+
+              fn_match = re.search(r"static\s+ssize_t\s+sel_write_access\s*\([^)]*\)\s*\{", text)
+              if not fn_match:
+                  raise RuntimeError("sel_write_access not found in security/selinux/selinuxfs.c")
+
+              fn_start = fn_match.start()
+              body_start = fn_match.end() - 1
+              depth = 0
+              fn_end = body_start
+              while fn_end < len(text):
+                  if text[fn_end] == "{":
+                      depth += 1
+                  elif text[fn_end] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          fn_end += 1
+                          break
+                  fn_end += 1
+
+              fn_code = text[fn_start:fn_end]
+
+              m_sscanf = re.search(r"if\s*\(\s*sscanf\s*\([^;]+goto\s+out\s*;", fn_code)
+              if not m_sscanf:
+                  raise RuntimeError("sscanf anchor not found in sel_write_access")
+
+              ctx_hook = (
+                  "\n\t/* hide_dirty_sepolicy */\n"
+                  "\tif (__kuid_val(current_uid()) >= 10000) {\n"
+                  "\t\tif (strstr(scon, \":ksu:\") || strstr(tcon, \":ksu:\") ||\n"
+                  "\t\t    strstr(scon, \":ksu_file:\") || strstr(tcon, \":ksu_file:\")) {\n"
+                  "\t\t\tlength = -EINVAL;\n"
+                  "\t\t\tgoto out;\n"
+                  "\t\t}\n"
+                  "\t}\n"
+              )
+              fn_code = fn_code[:m_sscanf.end()] + ctx_hook + fn_code[m_sscanf.end():]
+
+              m_av = re.search(r"security_compute_av_user\s*\([^;]+;", fn_code)
+              if not m_av:
+                  raise RuntimeError("security_compute_av_user anchor not found in sel_write_access")
+
+              av_hook = (
+                  "\n\tif (__kuid_val(current_uid()) >= 10000 && tclass != 0) {\n"
+                  "\t\tif ((strstr(scon, \":system_server:\") && strstr(tcon, \":system_server:\")) ||\n"
+                  "\t\t    (strstr(scon, \":kernel:\") && strstr(tcon, \":adb_data_file:\"))) {\n"
+                  "\t\t\tavd.allowed = 0;\n"
+                  "\t\t}\n"
+                  "\t}\n"
+              )
+              fn_code = fn_code[:m_av.end()] + av_hook + fn_code[m_av.end():]
+
+              text = text[:fn_start] + fn_code + text[fn_end:]
+              with open(path, "w") as f:
+                  f.write(text)
+              print("Patched: sel_write_access() in security/selinux/selinuxfs.c")
+          PYEOF
+      
       - name: Stub missing firmware include
         run: |
           d=drivers/input/touchscreen/mediatek/focaltech_touch/include/firmware
